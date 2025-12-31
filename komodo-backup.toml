@@ -1,1 +1,45 @@
-## Add resources to get started
+[[action]]
+name = "backup"
+tags = ["komodo-backup"]
+[action.config]
+webhook_enabled = false
+file_contents = """
+const stacks = await komodo.read('ListStacks', {});
+
+// Access arguments using the 'ARGS' object.
+console.log('Arguments', ARGS);
+
+const skipTag = (await komodo.read('GetTag', {tag: "backup.skip"}))._id.$oid;
+
+for (const stack of stacks) {
+  if (stack.tags.includes(skipTag)) {
+    console.log('Skipping stack', stack.name);
+    continue;
+  }
+
+  console.log('Start backup of stack', stack.name);
+  for (const service of stack.info.services) {
+    const container = await komodo.read('InspectStackContainer', {'stack': stack.id, 'service': service.service});
+    console.log('Process container', container)
+
+    // Stop container
+    // Backup volumes
+    // Start container
+  }
+}
+"""
+
+##
+
+[[action]]
+name = "restore"
+tags = ["komodo-backup"]
+[action.config]
+file_contents = """
+// Run actions using the pre initialized 'komodo' client.
+const version: Types.GetVersionResponse = await komodo.read('GetVersion', {});
+console.log('🦎 Komodo version:', version.version, '🦎\n');
+
+// Access arguments using the 'ARGS' object.
+console.log(ARGS);
+"""
