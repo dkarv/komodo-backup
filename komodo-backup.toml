@@ -4,27 +4,77 @@ tags = ["komodo-backup"]
 [action.config]
 webhook_enabled = false
 file_contents = """
-const stacks = await komodo.read('ListStacks', {});
+console.log('Arguments', ARGS)
 
-// Access arguments using the 'ARGS' object.
-console.log('Arguments', ARGS);
+const stacks = await komodo.read('ListStacks', {})
+// List servers to match server ids with names
+const servers = (await komodo.read('ListServers', {})).reduce((map, server) => {
+  map[server.id] = server.name;
+  return map;
+}, {});
+// Id of skip tag
+const skipTag = (await komodo.read('GetTag', {tag: "backup.skip"}))._id.$oid
+const failures: string[] = []
 
-const skipTag = (await komodo.read('GetTag', {tag: "backup.skip"}))._id.$oid;
 
 for (const stack of stacks) {
   if (stack.tags.includes(skipTag)) {
-    console.log('Skipping stack', stack.name);
-    continue;
+    console.log('Skipping stack', stack.name)
+    continue
   }
 
-  console.log('Start backup of stack', stack.name);
+  console.log('Start backup of stack', stack.name)
   for (const service of stack.info.services) {
-    const container = await komodo.read('InspectStackContainer', {'stack': stack.id, 'service': service.service});
-    console.log('Process container', container)
+    const container = await komodo.read('InspectStackContainer', {'stack': stack.id, 'service': service.service})
+    console.log('Process container', container.Name)
 
-    // Stop container
-    // Backup volumes
-    // Start container
+    // TODO Stop container
+  
+    // TODO Backup volumes
+    const labels = container.Config.Labels
+    const skipMounts = labels['komodo.backup.skipMounts']?.split(',') || []
+    // TODO based on labels, run pre commands
+    for (const mount of container.Mounts) {
+      if (skipMounts.includes(mount.Source)) {
+        console.log('Skipping volume', mount.Source)
+        continue
+      }
+
+      console.log('Start backup of volume', mount.Source)
+      const args = ARGS.servers[servers[stack.info.server_id]]
+      const result = await komodo.execute_and_poll('RunStackService', {stack: args.stack, service: args.service, command: ['ls']})
+      if (!result.success) {
+        failures.push(`${stack.name} - ${service.service}`)
+      }
+      printLogs(result.logs)
+    }
+  }
+}
+
+if (failures.length !== 0) {
+  console.error("Failed backups", failures)
+  throw new Error(`Failed backups: ${failures}`)
+}
+
+function printLogs(logs) {
+  for(const log of logs) {
+    const timestamp = Date(log.start_ts).toLocaleString()
+    console.log(`[${timestamp}] [${log.stage}] ${log.stderr}${log.stdout}`)
+  }
+}
+"""
+arguments_format = "json"
+arguments = """
+{
+  "servers": {
+    "beelink": {
+      "stack": "backup-beelink",
+      "service": "storage-box"
+    },
+    "cloud01": {
+      "stack": "backup-cloud01",
+      "service": "storage-box"
+    }
   }
 }
 """
