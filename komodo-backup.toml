@@ -42,7 +42,9 @@ for (const stack of stacks) {
 
       console.log('Start backup of volume', mount.Source)
       const args = ARGS.servers[servers[stack.info.server_id]]
-      const result = await komodo.execute_and_poll('RunStackService', {stack: args.stack, service: args.service, command: ['ls']})
+      const command = args.command
+      command.push(mount.Source)
+      const result = await komodo.execute_and_poll('RunStackService', {stack: args.stack, service: args.service, command: command})
       if (!result.success) {
         failures.push(`${stack.name} - ${service.service}`)
       }
@@ -69,11 +71,13 @@ arguments = """
   "servers": {
     "beelink": {
       "stack": "backup-beelink",
-      "service": "storage-box"
+      "service": "storage-box",
+      "command": ["snapshots"]
     },
     "cloud01": {
       "stack": "backup-cloud01",
-      "service": "storage-box"
+      "service": "storage-box",
+      "command": ["snapshots"]
     }
   }
 }
