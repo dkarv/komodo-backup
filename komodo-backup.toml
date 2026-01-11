@@ -1,0 +1,140 @@
+[[action]]
+name = "backup"
+tags = ["komodo-backup"]
+[action.config]
+webhook_enabled = false
+file_contents = """
+console.log('Arguments', ARGS)
+
+const stacks = await komodo.read('ListStacks', {})
+// List servers to match server ids with names
+const servers = (await komodo.read('ListServers', {})).reduce((map, server) => {
+  map[server.id] = server.name;
+  return map;
+}, {});
+// Id of skip tag
+const skipTag = (await komodo.read('GetTag', {tag: "backup.skip"}))._id.$oid
+const failures: string[] = []
+
+// beforeCommands
+for (const server in servers) {
+  const args = ARGS.servers[servers[server]]
+  await executeCommands(args, "beforeCommands", `${servers[server]} - beforeCommand`, null)
+}
+
+// backupCommands
+for (const stack of stacks) {
+  if (stack.tags.includes(skipTag)) {
+    console.log('Skipping stack', stack.name)
+    continue
+  }
+
+  console.log('Start backup of stack', stack.name)
+  for (const service of stack.info.services) {
+    const container = await komodo.read('InspectStackContainer', {'stack': stack.id, 'service': service.service})
+    console.log('Process container', container.Name)
+
+    // TODO Stop container
+  
+    // TODO Backup volumes
+    const labels = container.Config.Labels
+    const skipMounts = labels['komodo.backup.skipMounts']?.split(',') || []
+    // TODO based on labels, run pre commands
+    for (const mount of container.Mounts) {
+      if (skipMounts.includes(mount.Source) || mount.Type === "volume") {
+        console.log('Skipping volume', mount.Source)
+        continue
+      }
+
+      console.log('Start backup of volume', mount.Source)
+      const args = ARGS.servers[servers[stack.info.server_id]]
+      await executeCommands(args, "backupCommands", `${stack.name} - ${service.service}`, mount.Source)
+    }
+  }
+}
+
+// afterCommands
+for (const server in servers) {
+  const args = ARGS.servers[servers[server]]
+  await executeCommands(args, "afterCommands", `${servers[server]} - afterCommand`, null)
+}
+
+
+if (failures.length !== 0) {
+  console.error("Failed commands:", failures)
+  throw new Error(`Failed commands: ${failures}`)
+}
+
+async function executeCommands(args, cmdKey, id, additionalArg) {
+  if (args != null && args[cmdKey] != null) {
+    for (const command of args[cmdKey]) {
+      if (additionalArg != null) {
+        command.push(additionalArg)
+      }
+      const result = await komodo.execute_and_poll('RunStackService', {stack: args.stack, service: args.service, command: command})
+      if (!result.success) {
+        failures.push(id)
+      }
+      printLogs(result.logs)
+    }
+  }
+}
+
+function printLogs(logs) {
+  for(const log of logs) {
+    const timestamp = Date(log.start_ts).toLocaleString()
+    console.log(`[${timestamp}] [${log.stage}]`)
+    console.log(`${log.stderr}${log.stdout}`)
+  }
+}
+"""
+arguments_format = "json"
+arguments = """
+{
+  "servers": {
+    "beelink": {
+      "stack": "backup-beelink",
+      "service": "storage-box",
+      "beforeCommands" : [
+        ["unlock"]
+      ],
+      "backupCommands": [
+        ["backup"]
+      ],
+      "afterCommands": [
+        ["forget", "--prune", "--keep-daily", "14", "--keep-weekly", "4", "--keep-monthly", "3"],
+        ["snapshots"]
+      ]
+    },
+    "cloud01": {
+      "stack": "backup-cloud01",
+      "service": "storage-box",
+      "beforeCommands" : [
+        ["unlock"]
+      ],
+      "backupCommands": [
+        ["backup"]
+      ],
+      "afterCommands": [
+        ["forget", "--prune", "--keep-daily", "14", "--keep-weekly", "4", "--keep-monthly", "3"],
+        ["snapshots"]
+      ]
+    }
+  }
+}
+"""
+
+##
+
+[[action]]
+name = "restore"
+tags = ["komodo-backup"]
+[action.config]
+file_contents = """
+// Run actions using the pre initialized 'komodo' client.
+const version: Types.GetVersionResponse = await komodo.read('GetVersion', {});
+console.log('🦎 Komodo version:', version.version, '🦎\n');
+
+// Access arguments using the 'ARGS' object.
+console.log(ARGS);
+"""
