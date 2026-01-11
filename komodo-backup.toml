@@ -16,7 +16,13 @@ const servers = (await komodo.read('ListServers', {})).reduce((map, server) => {
 const skipTag = (await komodo.read('GetTag', {tag: "backup.skip"}))._id.$oid
 const failures: string[] = []
 
+// beforeCommands
+for (const server in servers) {
+  const args = ARGS.servers[servers[server]]
+  await executeCommands(args, "beforeCommands", `${servers[server]} - beforeCommand`, null)
+}
 
+// backupCommands
 for (const stack of stacks) {
   if (stack.tags.includes(skipTag)) {
     console.log('Skipping stack', stack.name)
@@ -35,33 +41,50 @@ for (const stack of stacks) {
     const skipMounts = labels['komodo.backup.skipMounts']?.split(',') || []
     // TODO based on labels, run pre commands
     for (const mount of container.Mounts) {
-      if (skipMounts.includes(mount.Source)) {
+      if (skipMounts.includes(mount.Source) || mount.Type === "volume") {
         console.log('Skipping volume', mount.Source)
         continue
       }
 
       console.log('Start backup of volume', mount.Source)
       const args = ARGS.servers[servers[stack.info.server_id]]
-      const command = args.command
-      command.push(mount.Source)
+      await executeCommands(args, "backupCommands", `${stack.name} - ${service.service}`, mount.Source)
+    }
+  }
+}
+
+// afterCommands
+for (const server in servers) {
+  const args = ARGS.servers[servers[server]]
+  await executeCommands(args, "afterCommands", `${servers[server]} - afterCommand`, null)
+}
+
+
+if (failures.length !== 0) {
+  console.error("Failed commands:", failures)
+  throw new Error(`Failed commands: ${failures}`)
+}
+
+async function executeCommands(args, cmdKey, id, additionalArg) {
+  if (args != null && args[cmdKey] != null) {
+    for (const command of args[cmdKey]) {
+      if (additionalArg != null) {
+        command.push(additionalArg)
+      }
       const result = await komodo.execute_and_poll('RunStackService', {stack: args.stack, service: args.service, command: command})
       if (!result.success) {
-        failures.push(`${stack.name} - ${service.service}`)
+        failures.push(id)
       }
       printLogs(result.logs)
     }
   }
 }
 
-if (failures.length !== 0) {
-  console.error("Failed backups", failures)
-  throw new Error(`Failed backups: ${failures}`)
-}
-
 function printLogs(logs) {
   for(const log of logs) {
     const timestamp = Date(log.start_ts).toLocaleString()
-    console.log(`[${timestamp}] [${log.stage}] ${log.stderr}${log.stdout}`)
+    console.log(`[${timestamp}] [${log.stage}]`)
+    console.log(`${log.stderr}${log.stdout}`)
   }
 }
 """
@@ -72,12 +95,30 @@ arguments = """
     "beelink": {
       "stack": "backup-beelink",
       "service": "storage-box",
-      "command": ["snapshots"]
+      "beforeCommands" : [
+        ["unlock"]
+      ],
+      "backupCommands": [
+        ["backup"]
+      ],
+      "afterCommands": [
+        ["forget", "--prune", "--keep-daily", "14", "--keep-weekly", "4", "--keep-monthly", "3"],
+        ["snapshots"]
+      ]
     },
     "cloud01": {
       "stack": "backup-cloud01",
       "service": "storage-box",
-      "command": ["snapshots"]
+      "beforeCommands" : [
+        ["unlock"]
+      ],
+      "backupCommands": [
+        ["backup"]
+      ],
+      "afterCommands": [
+        ["forget", "--prune", "--keep-daily", "14", "--keep-weekly", "4", "--keep-monthly", "3"],
+        ["snapshots"]
+      ]
     }
   }
 }
