@@ -4,8 +4,6 @@ tags = ["komodo-backup"]
 [action.config]
 webhook_enabled = false
 file_contents = """
-console.log('Arguments', ARGS)
-
 const stacks = await komodo.read('ListStacks', {})
 // List servers to match server ids with names
 const servers = (await komodo.read('ListServers', {})).reduce((map, server) => {
@@ -36,12 +34,12 @@ for (const stack of stacks) {
 
     // TODO Stop container
   
-    // TODO Backup volumes
+    // Backup volumes
     const labels = container.Config.Labels
     const skipMounts = labels['komodo.backup.skipMounts']?.split(',') || []
     // TODO based on labels, run pre commands
     for (const mount of container.Mounts) {
-      if (skipMounts.includes(mount.Source) || mount.Type === "volume") {
+      if (skipMounts.some(skip => mount.Source.startsWith(skip)) || mount.Type === "volume") {
         console.log('Skipping volume', mount.Source)
         continue
       }
@@ -99,10 +97,11 @@ arguments = """
         ["unlock"]
       ],
       "backupCommands": [
-        ["backup"]
+        ["backup", "--hostname", "beelink"]
       ],
       "afterCommands": [
-        ["forget", "--prune", "--keep-daily", "14", "--keep-weekly", "4", "--keep-monthly", "3"],
+        ["forget", "--prune", "--keep-within", "14d", "--keep-weekly", "4", "--keep-monthly", "3"],
+        ["forget", "--prune", " --group-by", "", "--keep-within", "6m"],
         ["snapshots"]
       ]
     },
@@ -113,10 +112,11 @@ arguments = """
         ["unlock"]
       ],
       "backupCommands": [
-        ["backup"]
+        ["backup", "--hostname", "cloud01"]
       ],
       "afterCommands": [
-        ["forget", "--prune", "--keep-daily", "14", "--keep-weekly", "4", "--keep-monthly", "3"],
+        ["forget", "--prune", "--keep-within", "14d", "--keep-weekly", "4", "--keep-monthly", "3"],
+        ["forget", "--prune", " --group-by", "", "--keep-within", "6m"],
         ["snapshots"]
       ]
     }
