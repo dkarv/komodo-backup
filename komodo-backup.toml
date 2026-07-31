@@ -88,17 +88,22 @@ async function executeCommands(args, cmdKey, id, additionalArg) {
       if (!result.success) {
         failures.push(id)
       }
-      printLogs(result.logs)
+      printLogs(result.logs, !result.success)
     }
   }
   return success
 }
 
-function printLogs(logs) {
+function printLogs(logs, error) {
   for(const log of logs) {
     const timestamp = Date(log.start_ts).toLocaleString()
-    console.log(`[${timestamp}] [${log.stage}]`)
-    console.log(`${log.stderr}${log.stdout}`)
+    if(error) {
+      console.error(`[${timestamp}] [${log.stage}]`)
+      console.error(`${log.stderr}${log.stdout}`)
+    } else {
+      console.log(`[${timestamp}] [${log.stage}]`)
+      console.log(`${log.stderr}${log.stdout}`)
+    }
   }
 }
 """
