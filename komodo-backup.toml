@@ -1,5 +1,5 @@
 [[action]]
-name = "backup"
+name = "backup-all"
 tags = ["komodo-backup"]
 [action.config]
 webhook_enabled = false
@@ -48,7 +48,7 @@ for (const stack of stacks) {
 
         console.log('Start backup of volume', mount.Source)
         const args = ARGS.servers[servers[stack.info.server_id]]
-        const success = await executeCommands(args, "backupCommands", `${stack.name} - ${service.service}`, mount.Source)
+        const success = await executeCommands(args, "backupCommands", `${stack.name} - ${service.service}`, mount.Source, false)
         if (success) {
           successes.push(servers[stack.info.server_id] + ":" + mount.Source)
         }
@@ -76,14 +76,20 @@ if (failures.length !== 0) {
   throw new Error(`Failed commands: ${failures}`)
 }
 
-async function executeCommands(args, cmdKey, id, additionalArg) {
+async function executeCommands(args, cmdKey, id, additionalArg, direct = true) {
   var success = true
   if (args != null && args[cmdKey] != null) {
     for (const command of args[cmdKey]) {
       if (additionalArg != null) {
         command.push(additionalArg)
       }
-      const result = await komodo.execute_and_poll('RunStackService', {stack: args.stack, service: args.service, command: command})
+      var result
+      if (direct) {
+        result = await komodo.execute_and_poll('RunStackService', {stack: args.stack, service: args.service, command: command})
+      } else {
+        // Run big commands in separate action to split logs
+        result = await komodo.execute_and_poll('RunAction', {action: "backup-one", args: {stack: args.stack, service: args.service, command: command}})
+      }
       success = success && result.success
       if (!result.success) {
         failures.push(id)
