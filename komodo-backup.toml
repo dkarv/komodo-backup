@@ -79,7 +79,7 @@ if (failures.length !== 0) {
 async function executeCommands(args, cmdKey, id, additionalArg, direct = true) {
   var success = true
   if (args != null && args[cmdKey] != null) {
-    for (const command of args[cmdKey]) {
+    for (const command of [...args[cmdKey]]) {
       if (additionalArg != null) {
         command.push(additionalArg)
       }
@@ -98,6 +98,35 @@ async function executeCommands(args, cmdKey, id, additionalArg, direct = true) {
     }
   }
   return success
+}
+
+function printLogs(logs, error) {
+  for(const log of logs) {
+    const timestamp = Date(log.start_ts).toLocaleString()
+    if(error) {
+      console.error(`[${timestamp}] [${log.stage}]`)
+      console.error(`${log.stderr}${log.stdout}`)
+    } else {
+      console.log(`[${timestamp}] [${log.stage}]`)
+      console.log(`${log.stderr}${log.stdout}`)
+    }
+  }
+  return success
+}
+"""
+
+##
+
+[[action]]
+name = "backup-one"
+tags = ["komodo-backup"]
+[action.config]
+file_contents = """
+console.log(ARGS)
+const result = await komodo.execute_and_poll('RunStackService', {stack: ARGS.stack, service: ARGS.service, command: ARGS.command})
+printLogs(result.logs, !result.success)
+if (!result.success) {
+  throw new Error("Error during backup")
 }
 
 function printLogs(logs, error) {
