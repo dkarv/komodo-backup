@@ -111,7 +111,6 @@ function printLogs(logs, error) {
       console.log(`${log.stderr}${log.stdout}`)
     }
   }
-  return success
 }
 """
 arguments_format = "json"
@@ -147,34 +146,6 @@ arguments = """
         ["forget", "--prune", " --group-by", "", "--keep-within", "6m"],
         ["snapshots"]
       ]
-    }
-  }
-}
-"""
-
-##
-
-[[action]]
-name = "backup-one"
-tags = ["komodo-backup"]
-[action.config]
-file_contents = """
-console.log(ARGS)
-const result = await komodo.execute_and_poll('RunStackService', {stack: ARGS.stack, service: ARGS.service, command: ARGS.command})
-printLogs(result.logs, !result.success)
-if (!result.success) {
-  throw new Error("Error during backup")
-}
-
-function printLogs(logs, error) {
-  for(const log of logs) {
-    const timestamp = Date(log.start_ts).toLocaleString()
-    if(error) {
-      console.error(`[${timestamp}] [${log.stage}]`)
-      console.error(`${log.stderr}${log.stdout}`)
-    } else {
-      console.log(`[${timestamp}] [${log.stage}]`)
-      console.log(`${log.stderr}${log.stdout}`)
     }
   }
 }
