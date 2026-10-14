@@ -17,8 +17,7 @@ const successes: string[] = []
 
 // beforeCommands
 for (const server in servers) {
-  const args = ARGS.servers[servers[server]]
-  await executeCommands(args, "beforeCommands", `${servers[server]} - beforeCommand`, null)
+  await executeCommands(servers[server], "beforeCommands")
 }
 
 // backupCommands
@@ -34,12 +33,12 @@ for (const stack of stacks) {
       const container = await komodo.read('InspectStackContainer', {'stack': stack.id, 'service': service.service})
       console.log('Process container', container.Name)
 
-      // TODO Stop container
+      const serverName = servers[stack.info.server_id]
   
       // Backup volumes
       const labels = container.Config.Labels
       const skipMounts = labels['komodo.backup.skipMounts']?.split(',') || []
-      // TODO based on labels, run pre commands
+      skipMounts.push(getArg(serverName, "ignore") as string)
       for (const mount of container.Mounts) {
         if (skipMounts.some(skip => mount.Source.startsWith(skip)) || mount.Type === "volume") {
           console.log('Skipping volume', mount.Source)
@@ -47,8 +46,7 @@ for (const stack of stacks) {
         }
 
         console.log('Start backup of volume', mount.Source)
-        const args = ARGS.servers[servers[stack.info.server_id]]
-        const success = await executeCommands(args, "backupCommands", `${stack.name} - ${service.service}`, mount.Source, false)
+        const success = await executeCommands(serverName, "backupCommands", mount.Source, false)
         if (success) {
           successes.push(servers[stack.info.server_id] + ":" + mount.Source)
         }
@@ -62,8 +60,7 @@ for (const stack of stacks) {
 
 // afterCommands
 for (const server in servers) {
-  const args = ARGS.servers[servers[server]]
-  await executeCommands(args, "afterCommands", `${servers[server]} - afterCommand`, null)
+  await executeCommands(servers[server], "afterCommands")
 }
 
 if (successes.length !== 0) {
@@ -76,75 +73,81 @@ if (failures.length !== 0) {
   throw new Error(`Failed commands: ${failures}`)
 }
 
-async function executeCommands(args, cmdKey, id, additionalArg, direct = true) {
-  var success = true
-  if (args != null && args[cmdKey] != null) {
-    for (const command of [...args[cmdKey]]) {
-      if (additionalArg != null) {
-        command.push(additionalArg)
-      }
-      var result
-      if (direct) {
-        result = await komodo.execute_and_poll('RunStackService', {stack: args.stack, service: args.service, command: command})
-      } else {
-        // Run big commands in separate action to split logs
-        result = await komodo.execute_and_poll('RunAction', {action: "backup-one", args: {stack: args.stack, service: args.service, command: command}})
-      }
-      success = success && result.success
-      if (!result.success) {
-        failures.push(id)
-      }
-      printLogs(result.logs, !result.success)
-    }
+function getArg(server: string, argKey: string): unknown {
+  const serverConfig = ARGS.servers[server];
+  if (!serverConfig) return undefined
+  if (argKey in serverConfig) {
+    return serverConfig[argKey]
   }
+  return ARGS["default"][argKey]
+}
+
+async function executeCommands(server, cmdKey, additionalArg = null, direct = true) {
+  const commands = getArg(server, cmdKey) as [string]
+  if (!commands) return false
+
+  let success = true
+
+  for (const command of commands) {
+    const args = { 
+      stack: getArg(server, "stack"), 
+      service: getArg(server, "service"), 
+      command: additionalArg ? [...command, additionalArg] : command 
+    }
+
+    const result = await komodo.execute_and_poll(
+      direct ? 'RunStackService' : 'RunAction',
+      direct ? args : { action: 'backup-one', args: args }
+    )
+
+    success &&= result.success
+
+    if (!result.success) failures.push(`${server} - ${cmdKey}`)
+
+    printLogs(result.logs, !result.success)
+  }
+
   return success
 }
 
 function printLogs(logs, error) {
-  for(const log of logs) {
-    const timestamp = Date(log.start_ts).toLocaleString()
-    if(error) {
-      console.error(`[${timestamp}] [${log.stage}]`)
-      console.error(`${log.stderr}${log.stdout}`)
-    } else {
-      console.log(`[${timestamp}] [${log.stage}]`)
-      console.log(`${log.stderr}${log.stdout}`)
-    }
-  }
+  logs.forEach(({ start_ts, stage, stderr, stdout }) => {
+    const prefix = `[${new Date(start_ts).toLocaleString()}] [${stage}]`;
+    const output = `${stderr}${stdout}`;
+
+    (error ? console.error : console.log)(prefix);
+    (error ? console.error : console.log)(output);
+  });
 }
 """
 arguments_format = "json"
 arguments = """
 {
+  "default": {
+    "service": "storage-box",
+    "beforeCommands" : [
+      ["unlock"]
+    ],
+    "afterCommands": [
+      ["forget", "--prune", "--keep-within", "14d", "--keep-weekly", "4", "--keep-monthly", "3"],
+      ["forget", "--prune", " --group-by", "", "--keep-within", "6m"],
+      ["snapshots"]
+    ],
+    "ignore": [
+      "/usr/share/fonts/"
+    ]
+  },
   "servers": {
     "beelink": {
       "stack": "backup-beelink",
-      "service": "storage-box",
-      "beforeCommands" : [
-        ["unlock"]
-      ],
       "backupCommands": [
         ["backup", "--host", "beelink"]
-      ],
-      "afterCommands": [
-        ["forget", "--prune", "--keep-within", "14d", "--keep-weekly", "4", "--keep-monthly", "3"],
-        ["forget", "--prune", " --group-by", "", "--keep-within", "6m"],
-        ["snapshots"]
       ]
     },
     "cloud01": {
       "stack": "backup-cloud01",
-      "service": "storage-box",
-      "beforeCommands" : [
-        ["unlock"]
-      ],
       "backupCommands": [
         ["backup", "--host", "cloud01"]
-      ],
-      "afterCommands": [
-        ["forget", "--prune", "--keep-within", "14d", "--keep-weekly", "4", "--keep-monthly", "3"],
-        ["forget", "--prune", " --group-by", "", "--keep-within", "6m"],
-        ["snapshots"]
       ]
     }
   }
