@@ -4,152 +4,85 @@ tags = ["komodo-backup"]
 [action.config]
 webhook_enabled = false
 file_contents = """
-const stacks = await komodo.read('ListStacks', {})
-// List servers to match server ids with names
-const servers = (await komodo.read('ListServers', {})).reduce((map, server) => {
-  map[server.id] = server.name;
-  return map;
-}, {});
-// Id of skip tag
-const skipTag = (await komodo.read('GetTag', {tag: "backup.skip"}))._id.$oid
+// Backs up the bind mounts of all stacks with restic, as one snapshot per server.
+// Skip a stack with the tag 'backup.skip', a mount with the label 'komodo.backup.skipMounts'.
+// Set "logLevel" to "debug" in the arguments to log every decision and the full restic output.
+const debug = ARGS.logLevel === 'debug'
+const log = (...msg) => { if (debug) console.log(...msg) }
+
+// Runs in the restic container: $0 is the server name, $@ are the paths to back up
+const script = [
+  'restic unlock',
+  'restic backup --host $0 --group-by host --no-scan "$@"',
+  // Recovery test: restore 20 random small files of the new snapshot and verify their content
+  "restic ls -l latest --host $0 | awk '/^-/ && $4 < 1000000 && !/[*?[]/' | shuf -n 20 | sed -E 's/^([^ ]+ +){6}//' > /tmp/sample",
+  'test -s /tmp/sample',
+  'restic restore latest --host $0 --include-file /tmp/sample --target /tmp/restore --verify',
+  'restic forget --prune --keep-within 14d --keep-weekly 4 --keep-monthly 12',
+  "restic forget --prune --group-by '' --keep-within 1y",
+].join(' && ')
+
+const servers = Object.fromEntries((await komodo.read('ListServers', {})).map(s => [s.id, s.name]))
+const skipTag = (await komodo.read('GetTag', { tag: 'backup.skip' }))._id.$oid
+const paths: Record<string, Set<string>> = {}
 const failures: string[] = []
-const successes: string[] = []
 
-// beforeCommands
-for (const server in servers) {
-  await executeCommands(servers[server], "beforeCommands")
-}
-
-// backupCommands
-for (const stack of stacks) {
+// Collect the bind mounts of all containers per server
+for (const stack of await komodo.read('ListStacks', {})) {
   if (stack.tags.includes(skipTag)) {
-    console.log('Skipping stack', stack.name)
+    log('Skip stack', stack.name)
     continue
   }
-
-  console.log('Start backup of stack', stack.name)
-  for (const service of stack.info.services) {
+  for (const { service } of stack.info.services) {
     try {
-      const container = await komodo.read('InspectStackContainer', {'stack': stack.id, 'service': service.service})
-      console.log('Process container', container.Name)
-
-      const serverName = servers[stack.info.server_id]
-  
-      // Backup volumes
-      const labels = container.Config.Labels
-      const skipMounts = labels['komodo.backup.skipMounts']?.split(',') || []
-      skipMounts.push(getArg(serverName, "ignore") as string)
+      const container = await komodo.read('InspectStackContainer', { stack: stack.id, service })
+      const skip = [...ARGS.ignore, ...(container.Config.Labels['komodo.backup.skipMounts']?.split(',') ?? [])]
       for (const mount of container.Mounts) {
-        if (skipMounts.some(skip => mount.Source.startsWith(skip)) || mount.Type === "volume") {
-          console.log('Skipping volume', mount.Source)
-          continue
-        }
-
-        console.log('Start backup of volume', mount.Source)
-        const success = await executeCommands(serverName, "backupCommands", mount.Source, false)
-        if (success) {
-          successes.push(servers[stack.info.server_id] + ":" + mount.Source)
+        if (mount.Type === 'volume' || skip.some(s => mount.Source.startsWith(s))) {
+          log('Skip mount', mount.Source)
+        } else {
+          (paths[servers[stack.info.server_id]] ??= new Set()).add(mount.Source)
         }
       }
     } catch (e) {
-      console.error('Error on stack', stack.name)
+      console.error('Cannot inspect', stack.name, service, e)
       failures.push(stack.name)
     }
   }
 }
 
-// afterCommands
-for (const server in servers) {
-  await executeCommands(servers[server], "afterCommands")
-}
-
-if (successes.length !== 0) {
-  console.log("Backed up:\n", successes.join('\n'))
-}
-
-
-if (failures.length !== 0) {
-  console.error("Failed commands:", failures)
-  throw new Error(`Failed commands: ${failures}`)
-}
-
-function getArg(server: string, argKey: string): unknown {
-  const serverConfig = ARGS.servers[server];
-  if (!serverConfig) return undefined
-  if (argKey in serverConfig) {
-    return serverConfig[argKey]
+// One restic container per server, all servers in parallel
+await Promise.all(Object.entries(paths).map(async ([server, mounts]) => {
+  const start = Date.now()
+  log(server, 'backs up', [...mounts])
+  try {
+    const update = await komodo.execute_and_poll('RunStackService', {
+      stack: ARGS.servers[server],
+      service: ARGS.service,
+      entrypoint: 'sh',
+      command: [debug ? '-xc' : '-c', script, server, ...mounts],
+    })
+    const output = update.logs.map(l => l.stderr + l.stdout).join('')
+    if (!update.success) throw output
+    log(output)
+    console.log(`${server}: backup of ${mounts.size} path(s) and sample restore OK in ${Math.round((Date.now() - start) / 1000)}s`)
+  } catch (e) {
+    console.error(server, 'failed:', e)
+    failures.push(server)
   }
-  return ARGS["default"][argKey]
-}
+}))
 
-async function executeCommands(server, cmdKey, additionalArg = null, direct = true) {
-  const commands = getArg(server, cmdKey) as [string]
-  if (!commands) return false
-
-  let success = true
-
-  for (const command of commands) {
-    const args = { 
-      stack: getArg(server, "stack"), 
-      service: getArg(server, "service"), 
-      command: additionalArg ? [...command, additionalArg] : command 
-    }
-
-    const result = await komodo.execute_and_poll(
-      direct ? 'RunStackService' : 'RunAction',
-      direct ? args : { action: 'backup-one', args: args }
-    )
-
-    success &&= result.success
-
-    if (!result.success) failures.push(`${server} - ${cmdKey}`)
-
-    printLogs(result.logs, !result.success)
-  }
-
-  return success
-}
-
-function printLogs(logs, error) {
-  logs.forEach(({ start_ts, stage, stderr, stdout }) => {
-    const prefix = `[${new Date(start_ts).toLocaleString()}] [${stage}]`;
-    const output = `${stderr}${stdout}`;
-
-    (error ? console.error : console.log)(prefix);
-    (error ? console.error : console.log)(output);
-  });
-}
+if (failures.length) throw new Error('Backup failed for: ' + failures.join(', '))
 """
 arguments_format = "json"
 arguments = """
 {
-  "default": {
-    "service": "storage-box",
-    "beforeCommands" : [
-      ["unlock"]
-    ],
-    "afterCommands": [
-      ["forget", "--prune", "--keep-within", "14d", "--keep-weekly", "4", "--keep-monthly", "3"],
-      ["forget", "--prune", " --group-by", "", "--keep-within", "6m"],
-      ["snapshots"]
-    ],
-    "ignore": [
-      "/usr/share/fonts/"
-    ]
-  },
+  "logLevel": "info",
+  "service": "storage-box",
+  "ignore": ["/usr/share/fonts/"],
   "servers": {
-    "beelink": {
-      "stack": "backup-beelink",
-      "backupCommands": [
-        ["backup", "--host", "beelink"]
-      ]
-    },
-    "cloud01": {
-      "stack": "backup-cloud01",
-      "backupCommands": [
-        ["backup", "--host", "cloud01"]
-      ]
-    }
+    "beelink": "backup-beelink",
+    "cloud01": "backup-cloud01"
   }
 }
 """
@@ -160,11 +93,107 @@ arguments = """
 name = "restore"
 tags = ["komodo-backup"]
 [action.config]
+webhook_enabled = false
 file_contents = """
-// Run actions using the pre initialized 'komodo' client.
-const version: Types.GetVersionResponse = await komodo.read('GetVersion', {});
-console.log('🦎 Komodo version:', version.version, '🦎\n');
+// Restores the bind mounts of the given stacks from the restic snapshots made by 'backup-all'.
+// Runs as a dry run unless "dryRun" is false. Otherwise each stack is stopped, its directories are
+// reset to the snapshot (files missing from the snapshot are deleted), and the stack is started again.
+// "paths" limits the restore to these directories (each inside a mount of the stacks).
+// If a restore fails, the stack stays stopped so the app never runs on half restored data.
+const debug = ARGS.logLevel === 'debug'
+const log = (...msg) => { if (debug) console.log(...msg) }
+const dryRun = ARGS.dryRun !== false
+const stackNames: string[] = ARGS.stacks ?? []
+const only: string[] = (ARGS.paths ?? []).map(p => p.replace(/\\/+$/, ''))
+if (!stackNames.length) throw new Error('Set "stacks" in the arguments to the stacks to restore')
 
-// Access arguments using the 'ARGS' object.
-console.log(ARGS);
+// Runs in the restic container: $0 is the server name, $1 the snapshot, the rest are the paths.
+// Single file mounts (configs from git) are skipped: 'snapshot:path' needs a directory.
+const script = `
+host=$0; snap=$1; shift
+for p in "$@"; do
+  if [ -f "$p" ]; then echo "Skip file $p"; continue; fi
+  echo "Restore $p"
+  ${dryRun ? '' : 'mkdir -p "$p"'}
+  restic restore "$snap:$p" --host "$host" --target "$p" --delete ${dryRun ? '--dry-run' : ''} ${debug ? '-vv' : ''} || exit 1
+done`
+
+const servers = Object.fromEntries((await komodo.read('ListServers', {})).map(s => [s.id, s.name]))
+const skipTag = (await komodo.read('GetTag', { tag: 'backup.skip' }))._id.$oid
+const stacks = (await komodo.read('ListStacks', {})).filter(s => stackNames.includes(s.name))
+const unknown = stackNames.filter(n => !stacks.some(s => s.name === n))
+if (unknown.length) throw new Error('Unknown stacks: ' + unknown.join(', '))
+
+// Collect the bind mounts like 'backup-all' does, so only backed up paths are restored
+const plan: { stack: string, server: string, paths: string[] }[] = []
+for (const stack of stacks) {
+  if (stack.tags.includes(skipTag)) throw new Error(`${stack.name} has the tag backup.skip, it has no backup`)
+  const server = servers[stack.info.server_id]
+  if (!ARGS.servers[server]) throw new Error(`No backup stack for server ${server} in the arguments`)
+  const mounts = new Set<string>()
+  for (const { service } of stack.info.services) {
+    const container = await komodo.read('InspectStackContainer', { stack: stack.id, service })
+    const skip = [...ARGS.ignore, ...(container.Config.Labels['komodo.backup.skipMounts']?.split(',') ?? [])]
+    for (const mount of container.Mounts) {
+      if (mount.Type === 'volume' || skip.some(s => mount.Source.startsWith(s))) log('Skip mount', mount.Source)
+      else mounts.add(mount.Source)
+    }
+  }
+  const inside = (p: string, dir: string) => p === dir || p.startsWith(dir + '/')
+  let paths = only.length ? only.filter(p => [...mounts].some(m => inside(p, m))) : [...mounts]
+  // A path inside another one is restored with it
+  paths = paths.filter(p => !paths.some(o => o !== p && inside(p, o)))
+  if (paths.length) plan.push({ stack: stack.name, server, paths })
+}
+const unmatched = only.filter(p => !plan.some(s => s.paths.some(q => p === q || p.startsWith(q + '/'))))
+if (unmatched.length) throw new Error('Not inside a backed up mount of the stacks: ' + unmatched.join(', '))
+if (!plan.length) throw new Error('Nothing to restore')
+
+for (const { stack, server, paths } of plan) {
+  console.log(`${dryRun ? '[dry run] ' : ''}${stack} on ${server}: restore ${ARGS.snapshot ?? 'latest'} to\\n  ${paths.join('\\n  ')}`)
+}
+
+const failures: string[] = []
+for (const { stack, server, paths } of plan) {
+  const start = Date.now()
+  try {
+    if (!dryRun) await run('StopStack', { stack })
+    const update = await run('RunStackService', {
+      stack: ARGS.servers[server],
+      service: ARGS.service,
+      entrypoint: 'sh',
+      command: [debug ? '-xc' : '-c', script, server, ARGS.snapshot ?? 'latest', ...paths],
+    })
+    console.log(update.logs.map(l => l.stderr + l.stdout).join(''))
+    if (!dryRun) await run('StartStack', { stack })
+    console.log(`${stack}: ${dryRun ? 'dry run' : 'restore'} OK in ${Math.round((Date.now() - start) / 1000)}s`)
+  } catch (e) {
+    console.error(stack, 'failed:', e, dryRun ? '' : '\\nThe stack is stopped, start it once the data is fixed.')
+    failures.push(stack)
+  }
+}
+
+if (failures.length) throw new Error('Restore failed for: ' + failures.join(', '))
+
+async function run(type, params) {
+  const update = await komodo.execute_and_poll(type, params)
+  if (!update.success) throw `${type}: ` + update.logs.map(l => l.stderr + l.stdout).join('')
+  return update
+}
+"""
+arguments_format = "json"
+arguments = """
+{
+  "stacks": [],
+  "paths": [],
+  "snapshot": "latest",
+  "dryRun": true,
+  "logLevel": "info",
+  "service": "restore",
+  "ignore": ["/usr/share/fonts/"],
+  "servers": {
+    "beelink": "backup-beelink",
+    "cloud01": "backup-cloud01"
+  }
+}
 """
